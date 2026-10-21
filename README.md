@@ -7,13 +7,16 @@ a plain file.
 The action sends the proposed record to [DomainCanary](https://domaincanary.com/),
 which resolves both the published record and the proposed one and compares them.
 
-- **Without an API key** it checks syntax, the 10-lookup limit, a `+all` ending, and which
-  addresses the change removes. A removed range is a warning, because there's no way to tell
-  from DNS alone whether anything still sends from it.
-- **With an API key** it also checks each removed range against the senders in your DMARC reports
-  from the last 90 days, and fails the check when one of them sent mail. The domain has to be
-  verified in your DomainCanary account. Keys work on every plan, including the free plan;
-  create one at <https://domaincanary.com/dashboard/account#api-key>.
+- **Without an API key** it checks syntax, the 10-lookup limit, a `+all` ending, and the SPF
+  result of addresses taken from every IP range in both records. The check fails when any of
+  those addresses passes SPF under the published record and not under the proposed one, so
+  removing a range that passes today fails the check whether or not anything still sends from it.
+  A removal is a warning only when the check can't test it: `a`, `mx`, `ptr`, `exists`, a macro,
+  or an include whose record it couldn't read.
+- **With an API key** it also tests each sender in your DMARC reports from the last 90 days, and
+  says how much mail a removed range still carried. The domain has to be verified in your
+  DomainCanary account. Keys work on every plan, including the free plan; create one at
+  <https://domaincanary.com/dashboard/account#api-key>.
 
 ## Usage
 
@@ -31,7 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: record
-        run: echo "spf=$(cat dns/spf.txt)" >> "$GITHUB_OUTPUT"
+        run: |
+          spf=$(cat dns/spf.txt)
+          case "$spf" in *$'\n'*|*$'\r'*)
+            echo "::error::Expected the SPF record on one line"; exit 1 ;;
+          esac
+          echo "spf=$spf" >> "$GITHUB_OUTPUT"
       - uses: domaincanary/spf-preflight-action@v1
         with:
           domain: example.com
@@ -39,6 +47,10 @@ jobs:
           api-key: ${{ secrets.DOMAINCANARY_API_KEY }}
           comment: true
 ```
+
+The record step stops on a file with more than one line. GitHub reads each line written to
+`$GITHUB_OUTPUT` as a separate output, so a second line starting with `spf=` would replace the
+record the action checks. Keep that check in whatever step produces the record.
 
 | Input | Required | Default | |
 | --- | --- | --- | --- |
@@ -77,6 +89,7 @@ place of the `record` step above, on the zone file you changed:
     if [ "$n" -ne 1 ]; then
       echo "::error::Expected one SPF record at the root, found $n"; exit 1
     fi
+    case "$spf" in *$'\r'*) echo "::error::The SPF record holds a line break"; exit 1 ;; esac
     echo "spf=$spf" >> "$GITHUB_OUTPUT"
 ```
 
@@ -96,8 +109,8 @@ dnscontrol print-ir 2>/dev/null \
       | .. | strings | select(startswith("v=spf1"))' | sort -u
 ```
 
-If you use `SPF_BUILDER`, this prints the record it builds, split across names when it is long;
-the check needs the root record, which is the first one.
+With `SPF_BUILDER`, this prints the root record only. The parts it splits off into other names
+are not checked; see "Records split across several names" below.
 
 **Terraform** (Cloudflare `content` or `value`, Route 53 `records`, and most other providers)
 
@@ -116,11 +129,25 @@ resources use.
 cat dns/spf.txt
 ```
 
+For DNSControl, Terraform and a plain file, put the command inside `spf=$(...)` in the `record`
+step of the usage example, so the one-line check runs on what it prints.
+
+## Records split across several names
+
+The action checks one record: the one you pass as `record`, for the name you pass as `domain`.
+Every record it includes is read from live DNS as you publish it today. So when `SPF_BUILDER` or
+your own setup splits a long record into includes such as `_spf1.example.com`, a pull request that
+changes only one of those includes looks unchanged to a check of the root.
+
+Run the action once more for each of your own names the pull request changes, with that name as
+`domain` and its proposed record as `record`.
+
 ## Pull requests from forks
 
 GitHub withholds secrets from workflows that run on pull requests from forks, so on a fork's pull
-request the action runs without a key: it checks syntax, lookups and removed addresses, and any
-removal is a warning. That is the safe default.
+request the action runs without a key. It still checks syntax, lookups and the addresses in both
+records, and a removed range that passes today still fails the check. It doesn't test the
+senders in your DMARC reports.
 
 Don't switch to `pull_request_target` to get the key into those runs. That event runs with your
 secrets, and checking out the fork's code under it hands them to whoever opened the pull request.
